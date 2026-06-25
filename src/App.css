@@ -1,0 +1,94 @@
+.app {
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 2rem;
+  position: relative;
+}
+
+h1 {
+  font-size: 2rem;
+  margin-bottom: 0.5rem;
+  text-align: center;
+}
+
+.description {
+  text-align: center;
+  color: #666;
+  margin-bottom: 2rem;
+}
+
+.draggable-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.draggable-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  padding: 1rem;
+  margin-bottom: 0.5rem;
+  background: #fff;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  cursor: grab;
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+  touch-action: none;
+}
+
+.draggable-item:hover {
+  border-color: var(--item-color);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.draggable-item.dragging {
+  visibility: hidden;
+}
+
+.drag-handle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  color: var(--item-color);
+  opacity: 0.5;
+  transition: opacity 0.2s ease;
+}
+
+.draggable-item:hover .drag-handle,
+.draggable-item.dragging .drag-handle {
+  opacity: 1;
+}
+
+.item-content {
+  flex: 1;
+  color: #333;
+  line-height: 1.5;
+}
+
+.drag-ghost {
+  position: fixed;
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  padding: 1rem;
+  background: #fff;
+  border-radius: 8px;
+  border: 2px solid var(--item-color);
+  cursor: grabbing;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  z-index: 1000;
+  pointer-events: none;
+  transform: scale(1.02);
+}
+
+.drag-ghost .drag-handle {
+  opacity: 1;
+}
