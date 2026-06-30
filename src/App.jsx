@@ -2,7 +2,6 @@ import { useState, useRef, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 import './App.css'
 
-// 初始列表数据，包含不同长度的内容以测试可变高度
 const initialItems = [
   { id: 1, content: '第一项 - 这是一个较短的项目', color: '#6366f1' },
   { id: 2, content: '第二项 - 这个项目的内容比较长，高度会更高一些，测试不同高度的元素是否能正确排序', color: '#8b5cf6' },
@@ -13,97 +12,95 @@ const initialItems = [
 ]
 
 function App() {
-  // 列表数据状态，拖拽结束后更新
   const [items, setItems] = useState(initialItems)
-  // 当前正在拖拽的元素ID（仅用于渲染时添加拖拽状态类）
   const [draggingId, setDraggingId] = useState(null)
   
-  // 列表容器引用
   const listRef = useRef(null)
-  // 各列表项DOM引用映射 {id: element}
   const itemRefs = useRef({})
-  // 拖拽过程中的坐标缓存 {id, height, offsetY, top, center}
-  const coordsRef = useRef([])
-  // 鼠标相对于拖拽元素左上角的偏移量
-  const dragOffsetRef = useRef({ x: 0, y: 0 })
-  // 拖拽时的幽灵元素引用
   const ghostElRef = useRef(null)
+  const dragOffsetRef = useRef({ x: 0, y: 0 })
+  
+  // 核心：静态影子坐标追踪
+  const itemsRef = useRef(items)
+  const itemPositionsRef = useRef([]) // 存储初始各个坑位的绝对中线，防止重排引起抖动
 
-  /**
-   * 重新计算所有元素的顶部位置和中心点位置
-   * @param {number} gap - 元素间距（默认8px）
-   */
-  const recalcCoords = useCallback((gap = 8) => {
-    let y = 0
-    coordsRef.current.forEach((coord) => {
-      coord.top = y
-      coord.center = y + coord.height / 2
-      y += coord.height + gap
+  itemsRef.current = items
+
+  // FLIP: 获取当前所有 DOM 节点的快照位置
+  const getRects = () => {
+    const rects = {}
+    itemsRef.current.forEach(item => {
+      const el = itemRefs.current[item.id]
+      if (el) rects[item.id] = el.getBoundingClientRect()
     })
-  }, [])
+    return rects
+  }
 
-  /**
-   * 交换两个坐标对象的位置
-   * @param {number} idx1 - 第一个索引
-   * @param {number} idx2 - 第二个索引
-   */
-  const swapCoords = useCallback((idx1, idx2) => {
-    const temp = coordsRef.current[idx1]
-    coordsRef.current[idx1] = coordsRef.current[idx2]
-    coordsRef.current[idx2] = temp
-  }, [])
+  // FLIP: 播放顺滑的避让动画
+  const applyFLIP = (firstRects, currentDraggingId) => {
+    const lastRects = getRects()
 
-  /**
-   * 更新指定元素的transform样式
-   * @param {number} id - 元素ID
-   * @param {number} offsetY - Y轴偏移量
-   */
-  const updateItemTransform = useCallback((id, offsetY) => {
-    const el = itemRefs.current[id]
-    if (el) {
-      el.style.transform = `translateY(${offsetY}px)`
-    }
-  }, [])
+    itemsRef.current.forEach(item => {
+      const el = itemRefs.current[item.id]
+      if (!el) return
 
-  /**
-   * 鼠标按下事件处理 - 开始拖拽
-   * @param {MouseEvent} e - 鼠标事件
-   * @param {Object} item - 当前拖拽的列表项数据
-   */
+      const first = firstRects[item.id]
+      const last = lastRects[item.id]
+
+      if (first && last) {
+        const deltaY = first.top - last.top
+
+        if (deltaY !== 0) {
+          if (item.id === currentDraggingId) {
+            el.style.transition = 'none'
+            el.style.transform = ''
+            return
+          }
+
+          // 动效补偿：先推回，再滑行
+          el.style.transition = 'none'
+          el.style.transform = `translateY(${deltaY}px)`
+
+          // 强刷重绘
+          el.getBoundingClientRect()
+
+          el.style.transition = 'transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1)'
+          el.style.transform = ''
+        }
+      }
+    })
+  }
+
   const handleMouseDown = useCallback((e, item) => {
     e.preventDefault()
     
     const itemEl = itemRefs.current[item.id]
-    // 立即隐藏原元素，避免残影
-    itemEl.style.visibility = 'hidden'
-    
+    if (!itemEl || !listRef.current) return
+
     const itemRect = itemEl.getBoundingClientRect()
-    const listRect = listRef.current.getBoundingClientRect()
     
-    // 初始化坐标数据：记录每个元素的高度和初始偏移
-    coordsRef.current = items.map((it) => {
-      const el = itemRefs.current[it.id]
-      const rect = el.getBoundingClientRect()
-      return {
-        id: it.id,
-        height: rect.height,
-        offsetY: 0
-      }
-    })
-    
-    // 计算初始top和center位置
-    recalcCoords()
-    
-    // 记录鼠标相对于元素左上角的偏移（用于保持鼠标在ghost中的位置不变）
     dragOffsetRef.current = {
       x: e.clientX - itemRect.left,
       y: e.clientY - itemRect.top
     }
-    
-    // 更新拖拽状态
+
+    // 【核心修复点 1】：在拖拽开始的这一瞬间，一口气把所有列表项当前的“初始物理中线”固化下来。
+    // 后续的 mousemove 只跟这组绝对死数据做对比，绝对不会因为数据重排而导致判定范围产生漂移！
+    itemPositionsRef.current = itemsRef.current.map((it) => {
+      const el = itemRefs.current[it.id]
+      const rect = el.getBoundingClientRect()
+      return {
+        id: it.id,
+        top: rect.top,
+        bottom: rect.bottom,
+        center: rect.top + rect.height / 2
+      }
+    })
+
     setDraggingId(item.id)
-    
-    // 创建幽灵元素（跟随鼠标移动）
+    itemEl.style.visibility = 'hidden'
+
+    // 创建随动影子
     const ghost = document.createElement('div')
     ghost.className = 'drag-ghost'
     ghost.style.left = itemRect.left + 'px'
@@ -113,179 +110,106 @@ function App() {
     ghost.innerHTML = itemEl.innerHTML
     document.body.appendChild(ghost)
     ghostElRef.current = ghost
-    
-    /**
-     * 鼠标移动事件处理 - 拖拽过程中
-     */
-    const handleMouseMove = (e) => {
-      const ghost = ghostElRef.current
-      if (!ghost) return
+
+    const handleMouseMove = (moveEvent) => {
+      if (!ghostElRef.current || !listRef.current) return
+
+      const ghostLeft = moveEvent.clientX - dragOffsetRef.current.x
+      const ghostTop = moveEvent.clientY - dragOffsetRef.current.y
+      ghostElRef.current.style.left = ghostLeft + 'px'
+      ghostElRef.current.style.top = ghostTop + 'px'
+
+      const ghostCenterY = ghostTop + itemRect.height / 2
       
-      // 更新幽灵元素位置
-      const ghostLeft = e.clientX - dragOffsetRef.current.x
-      const ghostTop = e.clientY - dragOffsetRef.current.y
-      ghost.style.left = ghostLeft + 'px'
-      ghost.style.top = ghostTop + 'px'
+      // 当前拖拽项在最新 items 数组中的索引
+      const currentIndex = itemsRef.current.findIndex(it => it.id === item.id)
       
-      // 计算ghost相对于列表容器顶部的位置
-      const ghostTopRel = ghostTop - listRect.top
-      
-      // 循环检测是否需要交换位置（支持一次移动多个位置）
-      let swapped = true
-      while (swapped) {
-        swapped = false
-        const currentIndex = coordsRef.current.findIndex(c => c.id === item.id)
-        if (currentIndex === -1) break
-        
-        const currentCoord = coordsRef.current[currentIndex]
-        const ghostBottomRel = ghostTopRel + currentCoord.height
-        
-        // 向下拖拽：检测是否超过下一个元素的中心点
-        if (currentIndex < coordsRef.current.length - 1) {
-          const nextCoord = coordsRef.current[currentIndex + 1]
-          if (ghostBottomRel > nextCoord.center) {
-            const movingDistance = currentCoord.height + 8
-            
-            // 下一个元素向上移动避让
-            nextCoord.offsetY -= movingDistance
-            updateItemTransform(nextCoord.id, nextCoord.offsetY)
-            
-            // 交换坐标位置
-            swapCoords(currentIndex, currentIndex + 1)
-            recalcCoords()
-            
-            swapped = true
-            continue
-          }
+      // 【核心修复点 2】：不再全局循环盲测。而是精准只和它的“上一个坑位”或“下一个坑位”的虚拟中线进行判定
+      let targetIndex = -1
+
+      // 尝试向下拖拽：如果越过了下方坑位的中线位置
+      if (currentIndex < itemsRef.current.length - 1) {
+        const nextItemInArray = itemsRef.current[currentIndex + 1]
+        const nextItemOriginalPos = itemPositionsRef.current.find(p => p.id === nextItemInArray.id)
+        if (nextItemOriginalPos && ghostCenterY > nextItemOriginalPos.center) {
+          targetIndex = currentIndex + 1
         }
-        
-        // 向上拖拽：检测是否超过上一个元素的中心点
-        if (currentIndex > 0) {
-          const prevCoord = coordsRef.current[currentIndex - 1]
-          if (ghostTopRel < prevCoord.center) {
-            const movingDistance = currentCoord.height + 8
-            
-            // 上一个元素向下移动避让
-            prevCoord.offsetY += movingDistance
-            updateItemTransform(prevCoord.id, prevCoord.offsetY)
-            
-            // 交换坐标位置
-            swapCoords(currentIndex, currentIndex - 1)
-            recalcCoords()
-            
-            swapped = true
-            continue
-          }
+      }
+
+      // 尝试向上拖拽：如果越过了上方坑位的中线位置
+      if (currentIndex > 0 && targetIndex === -1) {
+        const prevItemInArray = itemsRef.current[currentIndex - 1]
+        const prevItemOriginalPos = itemPositionsRef.current.find(p => p.id === prevItemInArray.id)
+        if (prevItemOriginalPos && ghostCenterY < prevItemOriginalPos.center) {
+          targetIndex = currentIndex - 1
         }
+      }
+
+      // 如果跨越了中线边界，立刻触发颠倒重排并施加 FLIP
+      if (targetIndex !== -1) {
+        const firstRects = getRects()
+
+        const newItems = [...itemsRef.current]
+        const [draggedItem] = newItems.splice(currentIndex, 1)
+        newItems.splice(targetIndex, 0, draggedItem)
+
+        flushSync(() => {
+          setItems(newItems)
+        })
+
+        applyFLIP(firstRects, item.id)
       }
     }
-    
-    /**
-     * 鼠标松开事件处理 - 结束拖拽
-     */
+
     const handleMouseUp = () => {
-      // 移除全局事件监听
       document.removeEventListener('mousemove', handleMouseMove)
       document.removeEventListener('mouseup', handleMouseUp)
-      
+
       const ghost = ghostElRef.current
-      if (!ghost) return
-      
-      // 获取当前拖拽元素在坐标数组中的位置
-      const currentIndex = coordsRef.current.findIndex(c => c.id === item.id)
-      if (currentIndex === -1) {
-        ghost.remove()
-        ghostElRef.current = null
-        setDraggingId(null)
-        return
+      if (!ghost || !listRef.current) return
+
+      const finalEl = itemRefs.current[item.id]
+      if (finalEl) {
+        const finalRect = finalEl.getBoundingClientRect()
+        ghost.style.transition = 'left 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), top 0.25s cubic-bezier(0.2, 0.8, 0.2, 1)'
+        ghost.style.left = finalRect.left + 'px'
+        ghost.style.top = finalRect.top + 'px'
       }
-      
-      // 计算幽灵元素最终目标位置
-      const listRect = listRef.current.getBoundingClientRect()
-      const targetCoord = coordsRef.current[currentIndex]
-      const targetTop = targetCoord.top + listRect.top + targetCoord.offsetY
-      const targetLeft = listRect.left
-      
-      // 添加过渡动画，让幽灵元素平滑移动到目标位置
-      ghost.style.transition = 'left 0.3s cubic-bezier(0.4, 0, 0.2, 1), top 0.3s cubic-bezier(0.4, 0, 0.2, 1)'
-      ghost.style.left = targetLeft + 'px'
-      ghost.style.top = targetTop + 'px'
-      
-      // 等待动画结束后清理
+
       setTimeout(() => {
-        // 移除幽灵元素
         if (ghostElRef.current) {
           ghostElRef.current.remove()
           ghostElRef.current = null
         }
         
-        // 临时禁用过渡，防止React重排时出现跳动
-        Object.values(itemRefs.current).forEach(el => {
-          if (el) el.style.transition = 'none'
-        })
+        const el = itemRefs.current[item.id]
+        if (el) el.style.visibility = ''
         
-        // 根据最终坐标顺序生成新的列表数据
-        const newItems = coordsRef.current.map(coord => 
-          items.find(it => it.id === coord.id)
-        ).filter(Boolean)
-        
-        // 同步更新状态（确保DOM立即重排）
-        flushSync(() => {
-          setItems(newItems)
-          setDraggingId(null)
-        })
-        
-        // 清理所有元素的transform和visibility
-        Object.values(itemRefs.current).forEach(el => {
-          if (el) {
-            el.style.transform = ''
-            el.style.visibility = ''
-          }
-        })
-        
-        // 清空坐标缓存
-        coordsRef.current = []
-        
-        // 恢复过渡效果
-        setTimeout(() => {
-          Object.values(itemRefs.current).forEach(el => {
-            if (el) el.style.transition = ''
-          })
-        }, 50)
-      }, 300)
+        setDraggingId(null)
+        itemPositionsRef.current = [] // 释放内存
+      }, 250)
     }
-    
-    // 添加全局事件监听
+
     document.addEventListener('mousemove', handleMouseMove)
     document.addEventListener('mouseup', handleMouseUp)
-  }, [items, recalcCoords, swapCoords, updateItemTransform])
-
-  /**
-   * 列表项ref回调 - 注册DOM引用
-   * @param {HTMLElement} el - DOM元素
-   * @param {Object} item - 列表项数据
-   */
-  const handleItemRef = (el, item) => {
-    if (el) {
-      itemRefs.current[item.id] = el
-    }
-  }
+  }, [])
 
   return (
     <div className="app">
-      <h1>拖拽排序 Demo</h1>
-      <p className="description">拖动列表项到目标位置，被经过的元素会主动避让</p>
+      <h1>终极稳健：静态索引 + FLIP 避让</h1>
+      <p className="description">彻底解决了动态高度在重排时的判定区漂移和闪烁 Bug</p>
       <ul ref={listRef} className="draggable-list">
         {items.map((item) => (
           <li
             key={item.id}
-            data-id={item.id}
-            ref={(el) => handleItemRef(el, item)}
+            ref={(el) => {
+              if (el) itemRefs.current[item.id] = el
+              else delete itemRefs.current[item.id]
+            }}
             className={`draggable-item ${draggingId === item.id ? 'dragging' : ''}`}
-            onMouseDown={(e) => handleMouseDown(e, item)}
             style={{ '--item-color': item.color }}
           >
-            <div className="drag-handle">
+            <div className="drag-handle" onMouseDown={(e) => handleMouseDown(e, item)}>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M11 4h2v2h-2V4zm0 10h2v2h-2v-2zm0-5h2v2h-2v-2zm-5 5h2v2H6v-2zm0-5h2v2H6v-2zm0-5h2v2H6V4zm10 10h2v2h-2v-2zm0-5h2v2h-2v-2zm0-5h2v2h-2V4z"/>
               </svg>
