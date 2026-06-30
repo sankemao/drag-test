@@ -1,5 +1,4 @@
 import { useState, useRef, useCallback } from 'react'
-import { flushSync } from 'react-dom'
 import './App.css'
 
 const initialItems = [
@@ -19,51 +18,48 @@ function App() {
   const itemRefs = useRef({})
   const ghostElRef = useRef(null)
   const dragOffsetRef = useRef({ x: 0, y: 0 })
-  
-  // 核心：静态影子坐标追踪
-  const itemsRef = useRef(items)
-  const itemPositionsRef = useRef([]) // 存储初始各个坑位的绝对中线，防止重排引起抖动
+  const itemPositionsRef = useRef([])
 
-  itemsRef.current = items
-
-  // FLIP: 获取当前所有 DOM 节点的快照位置
-  const getRects = () => {
-    const rects = {}
-    itemsRef.current.forEach(item => {
-      const el = itemRefs.current[item.id]
-      if (el) rects[item.id] = el.getBoundingClientRect()
+  // FLIP 核心：拍摄快照（纯粹在原生 DOM 层面工作，不依赖当前 React 状态）
+  const getDOMRects = (currentElements) => {
+    const rects = new Map()
+    currentElements.forEach(el => {
+      const id = el.getAttribute('data-id')
+      if (id) rects.set(id, el.getBoundingClientRect())
     })
     return rects
   }
 
-  // FLIP: 播放顺滑的避让动画
-  const applyFLIP = (firstRects, currentDraggingId) => {
-    const lastRects = getRects()
+  // FLIP 核心：直接对发生物理交换的 DOM 节点施加过渡动画
+  const applyFLIPToDOM = (firstRects, currentElements, currentDraggingId) => {
+    const lastRects = getDOMRects(currentElements)
 
-    itemsRef.current.forEach(item => {
-      const el = itemRefs.current[item.id]
-      if (!el) return
+    currentElements.forEach(el => {
+      const id = el.getAttribute('data-id')
+      if (!id) return
 
-      const first = firstRects[item.id]
-      const last = lastRects[item.id]
+      const first = firstRects.get(id)
+      const last = lastRects.get(id)
 
       if (first && last) {
         const deltaY = first.top - last.top
 
         if (deltaY !== 0) {
-          if (item.id === currentDraggingId) {
+          // 如果是正在被拖拽的真身的占位符，保持隐藏，不需要避让动画
+          if (id === String(currentDraggingId)) {
             el.style.transition = 'none'
             el.style.transform = ''
             return
           }
 
-          // 动效补偿：先推回，再滑行
+          // 避让的兄弟元素：瞬间推回旧位置
           el.style.transition = 'none'
           el.style.transform = `translateY(${deltaY}px)`
 
-          // 强刷重绘
+          // 强刷单个 DOM 的排版重绘
           el.getBoundingClientRect()
 
+          // 激活过渡，使其平滑滑行到物理新坑位
           el.style.transition = 'transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1)'
           el.style.transform = ''
         }
@@ -84,15 +80,13 @@ function App() {
       y: e.clientY - itemRect.top
     }
 
-    // 【核心修复点 1】：在拖拽开始的这一瞬间，一口气把所有列表项当前的“初始物理中线”固化下来。
-    // 后续的 mousemove 只跟这组绝对死数据做对比，绝对不会因为数据重排而导致判定范围产生漂移！
-    itemPositionsRef.current = itemsRef.current.map((it) => {
-      const el = itemRefs.current[it.id]
+    // 固化初始各个坑位的绝对中心点，作为 mousemove 判定的静态参考
+    const children = Array.from(listRef.current.children)
+    itemPositionsRef.current = children.map((el) => {
       const rect = el.getBoundingClientRect()
       return {
-        id: it.id,
-        top: rect.top,
-        bottom: rect.bottom,
+        element: el,
+        id: el.getAttribute('data-id'),
         center: rect.top + rect.height / 2
       }
     })
@@ -114,50 +108,52 @@ function App() {
     const handleMouseMove = (moveEvent) => {
       if (!ghostElRef.current || !listRef.current) return
 
-      const ghostLeft = moveEvent.clientX - dragOffsetRef.current.x
       const ghostTop = moveEvent.clientY - dragOffsetRef.current.y
-      ghostElRef.current.style.left = ghostLeft + 'px'
+      ghostElRef.current.style.left = (moveEvent.clientX - dragOffsetRef.current.x) + 'px'
       ghostElRef.current.style.top = ghostTop + 'px'
 
       const ghostCenterY = ghostTop + itemRect.height / 2
       
-      // 当前拖拽项在最新 items 数组中的索引
-      const currentIndex = itemsRef.current.findIndex(it => it.id === item.id)
+      const currentChildren = Array.from(listRef.current.children)
+      const currentIndex = currentChildren.indexOf(itemEl)
       
-      // 【核心修复点 2】：不再全局循环盲测。而是精准只和它的“上一个坑位”或“下一个坑位”的虚拟中线进行判定
-      let targetIndex = -1
+      let targetElement = null
 
-      // 尝试向下拖拽：如果越过了下方坑位的中线位置
-      if (currentIndex < itemsRef.current.length - 1) {
-        const nextItemInArray = itemsRef.current[currentIndex + 1]
-        const nextItemOriginalPos = itemPositionsRef.current.find(p => p.id === nextItemInArray.id)
-        if (nextItemOriginalPos && ghostCenterY > nextItemOriginalPos.center) {
-          targetIndex = currentIndex + 1
+      // 【向下物理检测】判断是否越过了 HTML 树中下一个元素的初始中心点
+      if (currentIndex < currentChildren.length - 1) {
+        const nextEl = currentChildren[currentIndex + 1]
+        const nextOriginalPos = itemPositionsRef.current.find(p => p.element === nextEl)
+        if (nextOriginalPos && ghostCenterY > nextOriginalPos.center) {
+          targetElement = nextEl
         }
       }
 
-      // 尝试向上拖拽：如果越过了上方坑位的中线位置
-      if (currentIndex > 0 && targetIndex === -1) {
-        const prevItemInArray = itemsRef.current[currentIndex - 1]
-        const prevItemOriginalPos = itemPositionsRef.current.find(p => p.id === prevItemInArray.id)
-        if (prevItemOriginalPos && ghostCenterY < prevItemOriginalPos.center) {
-          targetIndex = currentIndex - 1
+      // 【向上物理检测】判断是否越过了 HTML 树中上一个元素的初始中心点
+      if (currentIndex > 0 && !targetElement) {
+        const prevEl = currentChildren[currentIndex - 1]
+        const prevOriginalPos = itemPositionsRef.current.find(p => p.element === prevEl)
+        if (prevOriginalPos && ghostCenterY < prevOriginalPos.center) {
+          targetElement = prevEl
         }
       }
 
-      // 如果跨越了中线边界，立刻触发颠倒重排并施加 FLIP
-      if (targetIndex !== -1) {
-        const firstRects = getRects()
+      // 🔥 【核心优化点】：直接操作底层原生 DOM，跳过 React 状态更新！
+      if (targetElement) {
+        // FLIP: First
+        const firstRects = getDOMRects(currentChildren)
 
-        const newItems = [...itemsRef.current]
-        const [draggedItem] = newItems.splice(currentIndex, 1)
-        newItems.splice(targetIndex, 0, draggedItem)
+        // 判断是向上移还是向下移，并用 insertBefore 改变 DOM 树的真实节点顺序
+        if (currentChildren.indexOf(targetElement) > currentIndex) {
+          // 向下移：把当前项插到目标项的下一个兄弟节点前面
+          listRef.current.insertBefore(itemEl, targetElement.nextSibling)
+        } else {
+          // 向上移：把当前项插到目标项的前面
+          listRef.current.insertBefore(itemEl, targetElement)
+        }
 
-        flushSync(() => {
-          setItems(newItems)
-        })
-
-        applyFLIP(firstRects, item.id)
+        // FLIP: Last, Invert & Play
+        const updatedChildren = Array.from(listRef.current.children)
+        applyFLIPToDOM(firstRects, updatedChildren, item.id)
       }
     }
 
@@ -168,13 +164,10 @@ function App() {
       const ghost = ghostElRef.current
       if (!ghost || !listRef.current) return
 
-      const finalEl = itemRefs.current[item.id]
-      if (finalEl) {
-        const finalRect = finalEl.getBoundingClientRect()
-        ghost.style.transition = 'left 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), top 0.25s cubic-bezier(0.2, 0.8, 0.2, 1)'
-        ghost.style.left = finalRect.left + 'px'
-        ghost.style.top = finalRect.top + 'px'
-      }
+      const finalRect = itemEl.getBoundingClientRect()
+      ghost.style.transition = 'left 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), top 0.25s cubic-bezier(0.2, 0.8, 0.2, 1)'
+      ghost.style.left = finalRect.left + 'px'
+      ghost.style.top = finalRect.top + 'px'
 
       setTimeout(() => {
         if (ghostElRef.current) {
@@ -182,11 +175,23 @@ function App() {
           ghostElRef.current = null
         }
         
-        const el = itemRefs.current[item.id]
-        if (el) el.style.visibility = ''
+        itemEl.style.visibility = ''
         
+        // 恢复所有兄弟节点的 Transition 样式
+        Array.from(listRef.current.children).forEach(el => {
+          el.style.transition = ''
+        })
+
+        // 🎉 【大结局】：拖拽彻底结束后，只在最后这一刹那，统一同步一次 React 状态
+        const finalChildren = Array.from(listRef.current.children)
+        const finalItemsOrder = finalChildren.map(el => {
+          const id = Number(el.getAttribute('data-id'))
+          return initialItems.find(it => it.id === id) // 这里的 initialItems 也可以换成 items 闭包，但因为中途没改过，它们是一致的
+        }).filter(Boolean)
+
+        setItems(finalItemsOrder)
         setDraggingId(null)
-        itemPositionsRef.current = [] // 释放内存
+        itemPositionsRef.current = []
       }, 250)
     }
 
@@ -196,12 +201,13 @@ function App() {
 
   return (
     <div className="app">
-      <h1>终极稳健：静态索引 + FLIP 避让</h1>
-      <p className="description">彻底解决了动态高度在重排时的判定区漂移和闪烁 Bug</p>
+      <h1>极致微操：纯 DOM 操作 + FLIP 避让</h1>
+      <p className="description">拖拽中途 0 次 React 重绘，放手时一次性数据对齐</p>
       <ul ref={listRef} className="draggable-list">
         {items.map((item) => (
           <li
             key={item.id}
+            data-id={item.id} // 必须加 data-id 供原生 DOM 操作识别
             ref={(el) => {
               if (el) itemRefs.current[item.id] = el
               else delete itemRefs.current[item.id]
